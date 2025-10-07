@@ -1,0 +1,7 @@
+# requirements.txt
+py-cord[voice]
+python-dotenv
+faster-whisper
+google-genai
+langcodes
+webrtcvad-wheels
