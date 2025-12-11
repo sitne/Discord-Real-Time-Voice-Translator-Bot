@@ -5,7 +5,6 @@ import json
 import io
 import asyncio
 import wave
-from faster_whisper import WhisperModel
 import langcodes
 from google import genai
 import time
@@ -14,10 +13,13 @@ import webrtcvad
 import traceback
 import audioop
 
-# .envやIntents、JSON関連の関数は変更なし
+# ▼▼▼ 追加: Groqライブラリ ▼▼▼
+from groq import Groq
+
 load_dotenv()
 token = os.getenv("DISCORD_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY") # .envに GROQ_API_KEY を追加してください
 
 intents = discord.Intents.default()
 intents.voice_states = True
@@ -26,6 +28,7 @@ bot = discord.Bot(intents=intents)
 
 USER_LANGUAGES_FILE = "user_languages.json"
 
+# GroqのWhisperにもプロンプトとして渡せます
 VALORANT_PROMPT = (
     "VALORANT,ヴァロラント,ジェット,レイズ,オーメン,セージ,サイファー,ヴァイパー,ブリーチ,ブリムストーン,フェニックス,レイナ,キルジョイ,スカイ,ソーヴァ,アストラ"
     "Jett,Raze,Omen,Sage,Cypher,Viper,Breach,Brimstone,Phoenix,Reyna,Killjoy,Skye,Sova,Astra"
@@ -39,7 +42,7 @@ def load_languages():
         with open(USER_LANGUAGES_FILE, 'r') as f:
             data = json.load(f)
         return {int(k): v for k, v in data.items()}
-    except (FileNotFoundError, json.JSONDecodeError):
+    except:
         return {}
 
 def save_languages(data):
@@ -47,36 +50,38 @@ def save_languages(data):
         json.dump(data, f, indent=4)
 
 user_languages = load_languages()
-active_recordings = {}
 active_sinks = {}
 
-# モデルとAPIの初期化
-print("Whisperモデルをロード中...")
-whisper_model = WhisperModel("large-v3-turbo", device="cuda", compute_type="float16")
-print("Whisperモデルのロード完了。")
-
+# ▼▼▼ クライアント初期化 ▼▼▼
 if GEMINI_API_KEY:
-    client = genai.Client(api_key=GEMINI_API_KEY)
-    print("Gemini API Clientの初期化完了。")
+    # 翻訳用 (Gemini 2.5 Flash など)
+    gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+    print("Gemini API Client (Translation) initialized.")
 else:
-    client = None
-    print("警告: GEMINI_API_KEYが設定されていないため、翻訳機能は無効です。")
+    gemini_client = None
 
-# 無音オーディオソース
+if GROQ_API_KEY:
+    # 文字起こし用 (Whisper Large V3)
+    groq_client = Groq(api_key=GROQ_API_KEY)
+    print("Groq API Client (Whisper) initialized.")
+else:
+    groq_client = None
+    print("警告: GROQ_API_KEYが設定されていません。")
+
 class Silence(discord.AudioSource):
     def read(self):
-        return b'\x00\x00\x00\x00'
+        return b'\x00' * 3840
 
 class AutoTranslateSink(discord.sinks.Sink):
-    SPEECH_END_THRESHOLD_S = 2.5
-    MIN_SPEECH_DURATION_S = 2.0
+    SPEECH_END_THRESHOLD_S = 1.5 # 少し短くしてもGroqなら速いのでOK
+    MIN_SPEECH_DURATION_S = 1.5
     CHECK_INTERVAL_S = 0.2
 
     def __init__(self, vc: discord.VoiceClient, target_channel: discord.TextChannel):
         super().__init__()
         self.vc = vc
         self.target_channel = target_channel
-        self.vad = webrtcvad.Vad(3) # 0,1,2,3の4段階。3が最もノイズを除去する
+        self.vad = webrtcvad.Vad(3)
         self.speech_buffers = defaultdict(io.BytesIO)
         self.last_activity_time = defaultdict(float)
         self.is_speaking_map = defaultdict(bool)
@@ -87,7 +92,6 @@ class AutoTranslateSink(discord.sinks.Sink):
             return
         if not self.is_speaking_map.get(user_id):
             self.is_speaking_map[user_id] = True
-            print(f"[INFO] User {user_id} started speaking.")
         self.last_activity_time[user_id] = time.time()
         self.speech_buffers[user_id].write(data)
 
@@ -99,206 +103,186 @@ class AutoTranslateSink(discord.sinks.Sink):
             for user_id in users_to_check:
                 if not self.is_speaking_map[user_id]:
                     continue
-                time_since_last_audio = current_time - self.last_activity_time[user_id]
-                if time_since_last_audio > self.SPEECH_END_THRESHOLD_S:
-                    print(f"[INFO] Speech ended for user {user_id} ({time_since_last_audio:.2f}s silence). Processing audio.")
+                if (current_time - self.last_activity_time[user_id]) > self.SPEECH_END_THRESHOLD_S:
                     self.is_speaking_map[user_id] = False
                     buffer = self.speech_buffers.pop(user_id, None)
                     if buffer:
                         asyncio.create_task(self.process_user_audio(user_id, buffer))
 
     def stop(self):
-        print("[INFO] Stopping sink and cleaning up...")
         if self.checker_task:
             self.checker_task.cancel()
         for user_id, buffer in list(self.speech_buffers.items()):
-            print(f"[INFO] Processing leftover buffer for user {user_id}")
             asyncio.create_task(self.process_user_audio(user_id, buffer))
         self.speech_buffers.clear()
 
     def _stereo_to_mono(self, stereo_bytes: bytes) -> bytes:
         try:
             return audioop.tomono(stereo_bytes, 2, 1, 1)
-        except audioop.error as e:
-            print(f"[ERROR] Audioop error: {e}")
+        except:
             return b''
-
-    def _calculate_speech_duration_ms(self, pcm_data: bytes, sample_rate: int, frame_duration_ms: int) -> int:
-        frame_size = (sample_rate * frame_duration_ms // 1000) * 2
-        speech_frames = 0
-        for i in range(0, len(pcm_data), frame_size):
-            frame = pcm_data[i:i+frame_size]
-            if len(frame) < frame_size:
-                continue
-            try:
-                if self.vad.is_speech(frame, sample_rate):
-                    speech_frames += 1
-            except Exception:
-                pass
-        return speech_frames * frame_duration_ms
-    
-    async def process_user_audio(self, user_id: int, audio_buffer: io.BytesIO):
+        
+    def _is_audio_too_quiet(self, audio_bytes: bytes, threshold: int = 500) -> bool:
+        """音声が小さすぎる場合はTrue"""
         try:
-            # ▼▼▼ 変更点 1: ユーザーの言語設定を取得 ▼▼▼
+            rms = audioop.rms(audio_bytes, 2)  # 2 = sample width
+            return rms < threshold
+        except:
+            return True
+
+    async def process_user_audio(self, user_id: int, audio_buffer: io.BytesIO):
+        if not groq_client: return
+
+        try:
             user_setting = user_languages.get(user_id)
             if not user_setting or "source" not in user_setting:
-                # 設定がない、またはsourceが未設定のユーザーは処理しない
                 return
 
             source_lang_code = user_setting["source"]
-            target_lang_code = user_setting.get("target") # targetはなくても良い
+            target_lang_code = user_setting.get("target")
 
             audio_buffer.seek(0)
             original_stereo_bytes = audio_buffer.read()
             audio_buffer.close()
 
-            mono_audio_bytes = self._stereo_to_mono(original_stereo_bytes)
-            if not mono_audio_bytes: return
+            mono_bytes = self._stereo_to_mono(original_stereo_bytes)
+            if not mono_bytes: return
 
-            speech_duration_s = self._calculate_speech_duration_ms(mono_audio_bytes, 48000, 30) / 1000.0
-            if speech_duration_s < self.MIN_SPEECH_DURATION_S:
-                print(f"[INFO] Discarding audio from user {user_id} due to short speech duration ({speech_duration_s:.2f}s).")
+            # 音量チェックを追加
+            if self._is_audio_too_quiet(mono_bytes, threshold=500):
+                # print(f"[SKIP] Audio too quiet for user {user_id}")
                 return
 
-            wav_data = io.BytesIO()
-            with wave.open(wav_data, 'wb') as f:
-                f.setnchannels(2); f.setsampwidth(2); f.setframerate(48000); f.writeframes(original_stereo_bytes)
-            wav_data.seek(0)
+            # 48000Hz (Sample Rate) * 2 bytes/sample (16-bit) = 96000 bytes/second (モノラル)
+            bytes_per_second = 48000 * 2
+            speech_duration_s = len(mono_bytes) / bytes_per_second
             
-            # ▼▼▼ 変更点 2: `language`引数で文字起こし言語を強制指定 ▼▼▼
-            print(f"[PROCESS] Transcribing for user {user_id} in language: '{source_lang_code}'")
-            segments, info = await bot.loop.run_in_executor(
-                None, 
-                lambda: whisper_model.transcribe(
-                    wav_data, 
-                    beam_size=5, 
-                    initial_prompt=VALORANT_PROMPT,
-                    language=source_lang_code  # <-- ここが最重要！
+            if speech_duration_s < self.MIN_SPEECH_DURATION_S:
+                # print(f"[SKIP] Audio too short ({speech_duration_s:.2f}s) for user {user_id}. Min: {self.MIN_SPEECH_DURATION_S}s.")
+                return 
+
+            # ここでWAVファイルを作成 (Groqに送るため)
+            wav_buffer = io.BytesIO()
+
+            with wave.open(wav_buffer, 'wb') as f:
+                f.setnchannels(1) # WhisperはモノラルでOK
+                f.setsampwidth(2)
+                f.setframerate(48000)
+                f.writeframes(mono_bytes)
+            
+            wav_bytes = wav_buffer.getvalue()
+            # Groq APIはファイル名が必要なため、ダミーの名前をつける
+            wav_buffer.name = "audio.wav"
+            wav_buffer.seek(0)
+
+            print(f"[PROCESS] Sending audio to Groq (Whisper) for user {user_id}...")
+
+            # --- 1. Groqで文字起こし (STT) ---
+            # run_in_executorで非同期コンテキストをブロックしないように実行
+            def transcribe_sync():
+                return groq_client.audio.transcriptions.create(
+                    file=("audio.wav", wav_bytes), # バイナリを直接渡す
+                    model="whisper-large-v3-turbo",
+                    prompt=VALORANT_PROMPT,
+                    language=source_lang_code,
+                    response_format="json",
+                    temperature=0.2,
                 )
-            )
+
+            transcription = await bot.loop.run_in_executor(None, transcribe_sync)
+            original_text = transcription.text.strip()
             
-            original_text = " ".join([segment.text for segment in segments]).strip()
             if not original_text: return
 
+            # --- 結果表示の準備 ---
             user = await bot.fetch_user(user_id)
             embed = discord.Embed(description=f"**発言者:** {user.mention}", color=user.accent_color or discord.Colour.blue())
             embed.set_author(name=user.display_name, icon_url=user.display_avatar.url)
             
             source_lang_name = langcodes.Language.get(source_lang_code).language_name('ja')
             embed.add_field(name=f"原文 ({source_lang_name})", value=f"```{original_text}```", inline=False)
-            
-            # ▼▼▼ 変更点 3: 翻訳ロジックを新しい設定に対応 ▼▼▼
-            if client and target_lang_code and target_lang_code != source_lang_code:
-                lang_code, translated_text = await self.translate_text(original_text, source_lang_code, target_lang_code)
+
+            # --- 2. Geminiで翻訳 (Translation) ---
+            if gemini_client and target_lang_code and target_lang_code != "none" and target_lang_code != source_lang_code:
+                
+                target_lang_name = langcodes.Language.get(target_lang_code).language_name('ja')
+                
+                # 音声ではなく「テキスト」を送るので、制限に引っかかりにくい
+                prompt = (
+                    f"Translate the following text from {source_lang_name} to {target_lang_name}. "
+                    f"Output ONLY the translated text.\n\nText:\n{original_text}"
+                )
+                
+                # 軽量なモデルを使用
+                response = await gemini_client.aio.models.generate_content(
+                    model="gemma-3-27b-it", 
+                    contents=prompt
+                )
+                
+                translated_text = response.text.strip()
                 if translated_text:
-                    target_lang_name = langcodes.Language.get(lang_code).language_name('ja')
                     embed.add_field(name=f"翻訳 ({target_lang_name})", value=f"```{translated_text}```", inline=False)
 
             await self.target_channel.send(embed=embed)
-        
+
         except Exception as e:
-            print(f"Error in process_user_audio for user {user_id}: {e}"); traceback.print_exc()
+            print(f"Error for user {user_id}: {e}")
+            traceback.print_exc()
 
-    async def translate_text(self, text, source_lang, target_lang):
-        # (このメソッド自体は変更なし、呼び出し元が変わっただけ)
-        if not client: return target_lang, None
-        try:
-            source_lang_name_en = langcodes.Language.get(source_lang).language_name('en')
-            target_lang_name_en = langcodes.Language.get(target_lang).language_name('en')
-            prompt = f"Translate the following text from {source_lang_name_en} to {target_lang_name_en}. Respond ONLY with the translated text...\n\nOriginal text:\n\"\"\"\n{text}\n\"\"\""
-            response = await client.aio.models.generate_content(model="gemma-3-27b-it", contents=prompt)
-            response_text = response.text.strip()
-            if '"error"' in response_text and '"code"' in response_text:
-                print(f"API error: {response_text}")
-                return target_lang, "APIでエラーが発生しました。"
-            return target_lang, response_text
-        except Exception as e:
-            print(f"API exception: {e}")
-            return target_lang, "API接続エラー。"
-
-
-async def finished_callback(sink: AutoTranslateSink, *args):
-    """レコーディングが終了したときに呼び出される"""
-    print("Recording finished. Calling sink.stop().")
-    sink.stop()
-    # 変更点: active_sinksからの削除はコマンド側で行うため、ここでは何もしない
-
-# Botイベント
-@bot.event
-async def on_ready():
-    print("Bot is ready.")
-    print(f"{len(user_languages)}件のユーザー言語設定をロードしました。")
-    print("起動時のボイス接続チェックを実行中...")
-    for guild in bot.guilds:
-        if guild.voice_client:
-            print(f"サーバー「{guild.name}」でゾンビ接続を発見。強制切断します。")
-            await guild.voice_client.disconnect(force=True)
-            # 変更点: 状態管理変数の名前に合わせる
-            active_sinks.pop(guild.id, None)
-
-# 追加: 予期せぬ切断時のクリーンアップ処理
-@bot.event
-async def on_voice_state_update(member, before, after):
-    # ボット自身が切断された場合のみ処理
-    if member.id != bot.user.id or not before.channel or after.channel:
-        return
-
-    guild_id = before.channel.guild.id
-    print(f"BotがサーバーID {guild_id} のVCから切断されました。クリーンアップを実行します。")
-    
-    # 録音中だった場合は、Sinkを停止して後処理を行う
-    if guild_id in active_sinks:
-        sink = active_sinks.pop(guild_id)
-        sink.stop()
-        print(f"サーバーID {guild_id} のアクティブなSinkを停止・クリーンアップしました。")
-
-
-# --- コマンドの再編成 ---
+# --- コマンド周り (前回の修正済みバージョンを使用) ---
 
 @bot.slash_command(description="ボイスチャンネルに参加します。")
-async def join(ctx: discord.ApplicationContext):
-    if not ctx.author.voice:
-        return await ctx.respond("エラー: あなたがボイスチャンネルに参加していません。", ephemeral=True)
-    
+async def join(ctx):
+    await ctx.defer()
     if ctx.guild.voice_client:
-        return await ctx.respond("既にボイスチャンネルに接続しています。", ephemeral=True)
+        try:
+            await ctx.guild.voice_client.disconnect(force=True)
+            await asyncio.sleep(0.5)
+        except: pass
+
+    if not ctx.author.voice:
+        return await ctx.respond("ボイスチャンネルに参加していません。", ephemeral=True)
 
     try:
         vc = await ctx.author.voice.channel.connect()
-        # タイムアウト防止と、ボットが話さないようにするための設定
-        await vc.guild.change_voice_state(channel=vc.channel, self_mute=True)
-        # vc.play(Silence()) 
-        await ctx.respond(f"**{vc.channel.name}** に参加しました。\n`/start` コマンドで翻訳を開始できます。", ephemeral=True)
+        await ctx.guild.change_voice_state(channel=vc.channel, self_deaf=True)
+        await asyncio.sleep(1.0)
+        
+        if vc.is_connected():
+            vc.play(Silence())
+            await ctx.respond(f"**{vc.channel.name}** に参加しました。\n`/start` で翻訳を開始できます。")
+        else:
+            await ctx.respond("接続タイムアウト。", ephemeral=True)
+            
     except Exception as e:
-        print(f"Error in join command: {e}")
-        traceback.print_exc()
-        await ctx.respond(f"ボイスチャンネルへの接続中にエラーが発生しました: {e}", ephemeral=True)
+        print(f"Join error: {e}")
+        await ctx.respond(f"接続エラー: {e}", ephemeral=True)
 
-@bot.slash_command(description="リアルタイム翻訳を開始します。")
-async def start(ctx: discord.ApplicationContext):
+@bot.slash_command(description="開始")
+async def start(ctx):
+    await ctx.defer()
     vc = ctx.guild.voice_client
     global user_languages
-    user_languages = load_languages()  # 最新のユーザー言語設定をロード
-    if not vc:
-        return await ctx.respond("エラー: まず`/join`コマンドでボイスチャンネルに参加させてください。", ephemeral=True)
+    user_languages = load_languages()
 
+    if not vc or not vc.is_connected():
+        return await ctx.respond("`/join` してください。", ephemeral=True)
+    
     if ctx.guild.id in active_sinks:
-        return await ctx.respond("既にこのサーバーで翻訳が開始されています。", ephemeral=True)
+        return await ctx.respond("既に開始されています。", ephemeral=True)
 
     try:
-        # 録音を開始
         sink = AutoTranslateSink(vc=vc, target_channel=ctx.channel)
         vc.start_recording(sink, finished_callback)
         active_sinks[ctx.guild.id] = sink
-        
-        print(f"Recording started in guild {ctx.guild.id} for channel {ctx.channel.name}")
-        await ctx.respond(f"このチャンネルへのリアルタイム翻訳を開始しました。\n`/stop` コマンドで停止できます。", ephemeral=True)
-        
+        await ctx.respond("翻訳を開始しました。", ephemeral=True)
     except Exception as e:
-        print(f"Error in start command: {e}")
-        traceback.print_exc()
-        await ctx.respond(f"翻訳の開始中にエラーが発生しました: {e}", ephemeral=True)
+        print(f"Start error: {e}")
+        await ctx.respond(f"開始エラー: {e}", ephemeral=True)
 
+async def finished_callback(sink, *args):
+    sink.stop()
+    # コマンド側でのクリーンアップはleave/stopに任せる
 
 @bot.slash_command(description="リアルタイム翻訳を停止します。")
 async def stop(ctx: discord.ApplicationContext):
@@ -386,6 +370,12 @@ async def set_language(
 
     await ctx.respond(response_message, ephemeral=True)
 
+@bot.event
+async def on_ready():
+    print(f"Logged in as {bot.user}")
+
+# stop, leave, set_language コマンドは
+# 以前のコード（Turn 1 または Turn 5 の内容）をそのまま使ってください。
 
 if __name__ == "__main__":
     bot.run(token)

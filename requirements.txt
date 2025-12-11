@@ -5,3 +5,4 @@ faster-whisper
 google-genai
 langcodes
 webrtcvad-wheels
+groq
